@@ -21,10 +21,16 @@
 #include <libbpf.h>
 #include <linux/bpf.h>
 
+#include <string>
+#include <vector>
+
 namespace android {
 namespace bpf {
 // BPF loader implementation. Loads an eBPF ELF object
 int loadProg(const char* elfpath);
+// PICO: loads an eBPF ELF object without reusing pinned maps/programs (stale pins are unlinked
+// and recreated) and appends every pin path to unlinkList so the caller can remove them later.
+int loadProgWithUnlink(const char* elfpath, std::vector<std::string>& unlinkList);
 }  // namespace bpf
 }  // namespace android
 

@@ -588,5 +588,144 @@ int loadProg(const char* elfPath) {
     return ret;
 }
 
+/*
+ * PICO: loadProg variant used by the factory bpfserver/nettools. Pinned maps and programs are
+ * never reused: an existing pin is unlinked and the object is created, loaded and pinned again.
+ * Every pin location is appended to unlinkList (before it is checked) so the caller can unlink
+ * them when it unloads the object.
+ */
+static int createMapsWithUnlink(const char* elfPath, ifstream& elfFile, vector<int>& mapFds,
+                                vector<string>& unlinkList) {
+    int ret, fd;
+    vector<char> mdData;
+    vector<struct bpf_map_def> md;
+    vector<string> mapNames;
+    string fname = pathToFilename(string(elfPath), true);
+
+    ret = readSectionByName("maps", elfFile, mdData);
+    if (ret) return ret;
+    md.resize(mdData.size() / sizeof(struct bpf_map_def));
+    memcpy(md.data(), mdData.data(), mdData.size());
+
+    ret = getMapNames(elfFile, mapNames);
+    if (ret) return ret;
+
+    mapFds.resize(mapNames.size());
+
+    for (int i = 0; i < (int)mapNames.size(); i++) {
+        // Format of pin location is /sys/fs/bpf/map_<filename>_<mapname>
+        string mapPinLoc;
+
+        mapPinLoc = string(BPF_FS_PATH) + "map_" + fname + "_" + string(mapNames[i]);
+        unlinkList.push_back(mapPinLoc);
+        if (access(mapPinLoc.c_str(), F_OK) == 0) {
+            // The factory logs the fd of the previous map here (uninitialized for the first one).
+            ALOGD("bpf_create_map reusing map %s, ret: %d\n", mapNames[i].c_str(), fd);
+            unlink(mapPinLoc.c_str());
+        }
+
+        fd = bpf_create_map(md[i].type, mapNames[i].c_str(), md[i].key_size, md[i].value_size,
+                            md[i].max_entries, md[i].map_flags);
+        ALOGD("bpf_create_map name %s, ret: %d\n", mapNames[i].c_str(), fd);
+
+        if (fd < 0) return fd;
+        if (fd == 0) return -EINVAL;
+
+        ret = bpf_obj_pin(fd, mapPinLoc.c_str());
+        if (ret < 0) return ret;
+
+        mapFds[i] = fd;
+    }
+
+    return ret;
+}
+
+static int loadCodeSectionsWithUnlink(const char* elfPath, vector<codeSection>& cs,
+                                      const string& license, vector<string>& unlinkList) {
+    int ret, fd, kvers;
+
+    if ((kvers = getMachineKvers()) < 0) return -1;
+
+    string fname = pathToFilename(string(elfPath), true);
+
+    for (int i = 0; i < (int)cs.size(); i++) {
+        string progPinLoc;
+
+        // Format of pin location is
+        // /sys/fs/bpf/prog_<filename>_<mapname>
+        progPinLoc = string(BPF_FS_PATH) + "prog_" + fname + "_" + cs[i].name;
+        unlinkList.push_back(progPinLoc);
+        if (access(progPinLoc.c_str(), F_OK) == 0) {
+            // The factory logs the fd of the previous program here.
+            ALOGD("New bpf prog load reusing prog %s, ret: %d\n", cs[i].name.c_str(), fd);
+            unlink(progPinLoc.c_str());
+        }
+
+        vector<char> log_buf(BPF_LOAD_LOG_SZ, 0);
+
+        fd = bpf_prog_load(cs[i].type, cs[i].name.c_str(), (struct bpf_insn*)cs[i].data.data(),
+                           cs[i].data.size(), license.c_str(), kvers, 0,
+                           log_buf.data(), log_buf.size());
+        ALOGD("New bpf core prog_load for %s (%s) returned: %d\n", elfPath, cs[i].name.c_str(),
+              fd);
+
+        if (fd <= 0)
+            ALOGE("bpf_prog_load: log_buf contents: %s\n", (char *)log_buf.data());
+
+        if (fd < 0) return fd;
+        if (fd == 0) return -EINVAL;
+
+        ret = bpf_obj_pin(fd, progPinLoc.c_str());
+        if (ret < 0) return ret;
+
+        cs[i].prog_fd = fd;
+    }
+
+    return 0;
+}
+
+int loadProgWithUnlink(const char* elfPath, vector<string>& unlinkList) {
+    vector<char> license;
+    vector<codeSection> cs;
+    vector<int> mapFds;
+    int ret;
+
+    ifstream elfFile(elfPath, ios::in | ios::binary);
+    if (!elfFile.is_open()) return -1;
+
+    ret = readSectionByName("license", elfFile, license);
+    if (ret) {
+        ALOGE("Couldn't find license in %s\n", elfPath);
+        return ret;
+    } else {
+        ALOGD("Loading ELF object %s with license %s\n", elfPath, (char*)license.data());
+    }
+
+    ret = readCodeSections(elfFile, cs);
+    if (ret) {
+        ALOGE("Couldn't read all code sections in %s\n", elfPath);
+        return ret;
+    }
+
+    /* Just for future debugging */
+    if (0) dumpAllCs(cs);
+
+    ret = createMapsWithUnlink(elfPath, elfFile, mapFds, unlinkList);
+    if (ret) {
+        ALOGE("Failed to create maps: (ret=%d) in %s\n", ret, elfPath);
+        return ret;
+    }
+
+    for (int i = 0; i < (int)mapFds.size(); i++)
+        ALOGD("map_fd found at %d is %d in %s\n", i, mapFds[i], elfPath);
+
+    applyMapRelo(elfFile, mapFds, cs);
+
+    ret = loadCodeSectionsWithUnlink(elfPath, cs, string(license.data()), unlinkList);
+    if (ret) ALOGE("Failed to load programs, loadCodeSections ret=%d\n", ret);
+
+    return ret;
+}
+
 }  // namespace bpf
 }  // namespace android
